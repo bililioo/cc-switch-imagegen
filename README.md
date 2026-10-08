@@ -13,18 +13,19 @@ An image-generation skill for Codex that routes image creation and editing throu
 
 Copy this directory into your Codex skills directory, or install the packaged `.skill` artifact from the releases/output of this repository.
 
-The relay must be running at `http://127.0.0.1:15721/v1/responses` by default. Override the endpoint with `CC_SWITCH_RESPONSES_URL`, the model with `CC_SWITCH_IMAGE_MODEL`, and the bearer token with `CC_SWITCH_BEARER_TOKEN`.
+The relay must be running at `http://127.0.0.1:15721/v1/responses` by default. The script resolves the newest model available to CC Switch at runtime, checking `/v1/models`, the local CC Switch/Codex catalogs, and the active Codex model. Override the endpoint with `CC_SWITCH_RESPONSES_URL`, the model with `CC_SWITCH_IMAGE_MODEL`, and the bearer token with `CC_SWITCH_BEARER_TOKEN`.
 
 ## Direct script usage
 
 ```bash
 python3 scripts/cc_switch_imagegen.py \
   --prompt 'Use case: stylized-concept; Primary request: a nuclear-powered mechanical bull' \
-  --model gpt-image-2 \
   --quality medium \
   --size 1024x1024 \
   --output outputs/image.png
 ```
+
+Use `--model <id>` when a particular image-capable model is required. Without an override, the default follows the active CC Switch model configuration and falls back to `gpt-6.1-sol` only when discovery is unavailable.
 
 For editing or compositing, repeat `--input-image path/to/source.png`. The script sends local images as data URLs and never prints the bearer token or full API response.
 

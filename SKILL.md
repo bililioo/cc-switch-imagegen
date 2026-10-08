@@ -12,7 +12,8 @@ Use this skill as the image generation workflow when requests must go through th
 - Call `scripts/cc_switch_imagegen.py`; do not use the unavailable built-in `image_gen` tool.
 - Default endpoint: `http://127.0.0.1:15721/v1/responses`.
 - Default bearer token: `PROXY_MANAGED`; override with `CC_SWITCH_BEARER_TOKEN` without printing it.
-- Default model: `gpt-5.6-sol`; override with `CC_SWITCH_IMAGE_MODEL` or `--model`. Use a relay-supported image-capable model when the user names one, such as `gpt-image-2.5-sunburst`.
+- Default model: resolve the newest model exposed by CC Switch at runtime. Resolution order is `--model`, `CC_SWITCH_IMAGE_MODEL`, the relay's `/v1/models`, the local CC Switch/Codex model catalog, the active Codex model, and finally `gpt-6.1-sol`. Use a relay-supported image-capable model when the user names one, such as `gpt-image-2.5-sunburst`.
+- The resolver is best effort and never changes the endpoint or provider. If CC Switch does not expose model metadata, it uses the current local CC Switch/Codex model configuration rather than silently selecting another provider.
 - The request uses the Responses API `image_generation` tool. The relay must return an `image_generation_call` with a base64 `result`.
 - Do not silently fall back to a direct OpenAI endpoint or another provider. If the relay is unavailable or rejects the request, report the concrete error.
 
@@ -65,11 +66,12 @@ For edits, state invariants explicitly and repeat them on every iteration: `chan
 ```bash
 python3 scripts/cc_switch_imagegen.py \
   --prompt 'Use case: stylized-concept ...' \
-  --model gpt-5.6-sol \
   --quality medium \
   --size 1916x821 \
   --output outputs/generated-image.png
 ```
+
+Pass `--model <id>` or set `CC_SWITCH_IMAGE_MODEL` when a specific relay-supported model is required. The script discovers the default model from CC Switch before each request so switching the active CC Switch model does not require editing this skill.
 
 Use `--input-image path/to/source.png` one or more times for edit or compositing requests. The script embeds local images as data URLs in the relay request and only accepts base64 image results in the response; it does not fetch arbitrary remote URLs.
 
