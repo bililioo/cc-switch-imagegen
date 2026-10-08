@@ -9,16 +9,20 @@ import binascii
 import json
 import mimetypes
 import os
+import re
+import sqlite3
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:15721/v1/responses"
-DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_TOKEN = "PROXY_MANAGED"
+MODEL_DISCOVERY_TIMEOUT = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,13 +31,170 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output image path")
     parser.add_argument("--input-image", action="append", default=[], help="Local edit/reference image; repeatable")
     parser.add_argument("--endpoint", default=os.getenv("CC_SWITCH_RESPONSES_URL", DEFAULT_ENDPOINT))
-    parser.add_argument("--model", default=os.getenv("CC_SWITCH_IMAGE_MODEL", DEFAULT_MODEL))
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Image-capable model; defaults to the newest model exposed by CC Switch",
+    )
     parser.add_argument("--quality", choices=("low", "medium", "high", "xhigh", "max", "auto"))
     parser.add_argument("--size", help="Requested image size, for example 1024x1024")
     parser.add_argument("--background", choices=("opaque", "transparent", "auto"))
     parser.add_argument("--output-format", choices=("png", "jpeg", "webp"))
     parser.add_argument("--timeout", type=float, default=300.0)
     return parser.parse_args()
+
+
+def _model_sort_key(model: Dict[str, Any]) -> Tuple[int, int, Tuple[str, ...], str]:
+    """Sort newer model ids first while keeping deterministic tie-breaking."""
+    model_id = str(model.get("id") or model.get("model") or "")
+    created = model.get("created") or model.get("created_at") or 0
+    try:
+        created_value = int(created)
+    except (TypeError, ValueError):
+        created_value = 0
+    version_tokens: Tuple[str, ...] = tuple(
+        f"0{int(token):020d}" if token.isdigit() else f"1{token.lower()}"
+        for token in re.findall(r"\d+|[a-z]+", model_id)
+    )
+    image_hint = int(_looks_image_capable(model))
+    return (image_hint, created_value, version_tokens, model_id.lower())
+
+
+def _looks_image_capable(model: Dict[str, Any]) -> bool:
+    """Return whether model metadata or its id indicates image generation support."""
+    metadata = " ".join(
+        str(model.get(field, ""))
+        for field in (
+            "id",
+            "model",
+            "name",
+            "description",
+            "capabilities",
+            "modalities",
+            "input_modalities",
+            "output_modalities",
+            "tools",
+        )
+    ).lower()
+    return any(token in metadata for token in ("image", "dall-e", "dalle", "imagen", "flux"))
+
+
+def _model_id(model: Dict[str, Any]) -> Optional[str]:
+    value = model.get("id") or model.get("model") or model.get("slug") or model.get("name")
+    return str(value).strip() if value else None
+
+
+def _select_model(models: Iterable[Dict[str, Any]]) -> Optional[str]:
+    candidates = [model for model in models if _model_id(model)]
+    if not candidates:
+        return None
+    image_candidates = [model for model in candidates if _looks_image_capable(model)]
+    selected = max(image_candidates or candidates, key=_model_sort_key)
+    return _model_id(selected)
+
+
+def _get_json(url: str, token: str, timeout: float = MODEL_DISCOVERY_TIMEOUT) -> Any:
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _discover_from_models_endpoint(endpoint: str, token: str) -> Optional[str]:
+    parsed = urllib.parse.urlsplit(endpoint)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/responses"):
+        path = path[: -len("/responses")] or "/"
+    models_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, f"{path.rstrip('/')}/models", "", ""))
+    try:
+        payload = _get_json(models_url, token)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict):
+        payload = payload.get("data") or payload.get("models") or []
+    if not isinstance(payload, list):
+        return None
+    return _select_model(item for item in payload if isinstance(item, dict))
+
+
+def _discover_from_catalog() -> Optional[str]:
+    catalog_paths = [
+        os.getenv("CC_SWITCH_MODEL_CATALOG"),
+        "~/.codex/cc-switch-model-catalog.json",
+        "~/.codex/codex-models.json",
+    ]
+    for raw_path in catalog_paths:
+        if not raw_path:
+            continue
+        try:
+            payload = json.loads(Path(raw_path).expanduser().read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        models = payload.get("models", []) if isinstance(payload, dict) else payload
+        if isinstance(models, list):
+            selected = _select_model(item for item in models if isinstance(item, dict))
+            if selected:
+                return selected
+    return None
+
+
+def _discover_from_codex_config() -> Optional[str]:
+    paths = [os.getenv("CODEX_CONFIG"), "~/.codex/config.toml"]
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        try:
+            text = Path(raw_path).expanduser().read_text(encoding="utf-8")
+        except OSError:
+            continue
+        match = re.search(r"(?m)^\s*model\s*=\s*[\"']([^\"']+)[\"']", text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _discover_from_cc_switch_db() -> Optional[str]:
+    db_path = os.getenv("CC_SWITCH_DB", "~/.cc-switch/cc-switch.db")
+    try:
+        uri = f"file:{Path(db_path).expanduser()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as connection:
+            rows = connection.execute(
+                "SELECT settings_config FROM providers "
+                "WHERE app_type = 'codex' AND is_current = 1 LIMIT 1"
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+    for (settings_config,) in rows:
+        try:
+            payload = json.loads(settings_config)
+            config = payload.get("config", "") if isinstance(payload, dict) else ""
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        match = re.search(r"(?m)^\s*model\s*=\s*[\"']([^\"']+)[\"']", config)
+        if match:
+            return match.group(1)
+    return None
+
+
+def resolve_model(explicit_model: Optional[str], endpoint: str, token: str) -> str:
+    """Resolve an explicit override, then the newest model known to CC Switch."""
+    if explicit_model:
+        return explicit_model
+    env_model = os.getenv("CC_SWITCH_IMAGE_MODEL")
+    if env_model:
+        return env_model
+    for discover in (
+        lambda: _discover_from_models_endpoint(endpoint, token),
+        _discover_from_codex_config,
+        _discover_from_cc_switch_db,
+        _discover_from_catalog,
+    ):
+        model = discover()
+        if model:
+            return model
+    return DEFAULT_MODEL
 
 
 def read_prompt(raw: str) -> str:
@@ -150,6 +311,7 @@ def main() -> int:
     if not prompt:
         raise ValueError("prompt must not be empty")
     token = os.getenv("CC_SWITCH_BEARER_TOKEN", DEFAULT_TOKEN)
+    args.model = resolve_model(args.model, args.endpoint, token)
     response = post_json(args.endpoint, token, request_payload(args, prompt), args.timeout)
     output_path = write_output(args.output, image_result(response))
     print(json.dumps({"output": str(output_path), "model": args.model, "endpoint": args.endpoint}, ensure_ascii=False))
